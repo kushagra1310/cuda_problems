@@ -12,10 +12,11 @@ __global__ void reduce(double* arr, double* sums, int n)
         shared[threadIdx.x] = 0.0f;
     __syncthreads();
 
-    for(int stride = 1; stride<blockDim.x; stride<<=1)
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1)
     {
-        if(threadIdx.x%(stride<<1)==0)
-            shared[threadIdx.x]+=shared[threadIdx.x+stride];
+        if (threadIdx.x < stride)
+            shared[threadIdx.x] += shared[threadIdx.x + stride];
+
         __syncthreads();
     }
     if(threadIdx.x == 0)
