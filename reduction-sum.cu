@@ -31,7 +31,6 @@ int main()
     int num_blocks=(n+num_threads-1)/num_threads;
 
     double* arr=(double*)malloc(n*sizeof(double));
-    double* partial_sum=(double*)malloc(num_blocks*sizeof(double));
 
     for(int i=0; i<n; i++)
     {
@@ -50,8 +49,15 @@ int main()
     cudaEventCreate(&stop);
 
     cudaEventRecord(start);
-
-    reduce<<<num_blocks,num_threads, 256*sizeof(double)>>>(carr, csum, n);
+    while(num_blocks>1)
+    {
+        num_blocks=(n+num_threads-1)/num_threads;
+        reduce<<<num_blocks,num_threads, num_threads*sizeof(double)>>>(carr, csum, n);
+        n=num_blocks;
+        double *temp = carr;
+        carr = csum;
+        csum = temp;
+    }
 
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
@@ -61,9 +67,7 @@ int main()
 
     printf("Kernel time: %.6f ms\n", milliseconds);
 
-    cudaMemcpy(partial_sum, csum, num_blocks*sizeof(double), cudaMemcpyDeviceToHost);
-    for(int i=0; i<num_blocks; i++)
-        sum+=partial_sum[i];
+    cudaMemcpy(&sum, carr, sizeof(double), cudaMemcpyDeviceToHost);
     printf("%f\n",sum);
     return 0;
 }
