@@ -1,21 +1,36 @@
 #include <stdio.h>
+#define TILE_SIZE 16
 
 __global__ void transpose(float* input, float* output, int m, int n)
 {
     int x=threadIdx.x + blockDim.x*blockIdx.x;
     int y=threadIdx.y + blockDim.y*blockIdx.y;
 
-    if(x<m && y<n)
+    __shared__ float tile[TILE_SIZE][TILE_SIZE+1];
+
+    if (x < n && y < m)
     {
-        output[x*n+y]=input[y*m+x];
+        tile[threadIdx.y][threadIdx.x] =
+            input[y * n + x];
+    }
+    else
+        tile[threadIdx.y][threadIdx.x] = 0.0f;
+    __syncthreads();
+
+    int out_col = blockIdx.y * TILE_SIZE + threadIdx.x;
+    int out_row = blockIdx.x * TILE_SIZE + threadIdx.y;
+
+    if (out_col < m && out_row < n)
+    {
+        output[out_row*m+out_col]=tile[threadIdx.x][threadIdx.y];
     }
 }
 
 int main()
 {
-    int rows=5;
-    int cols=6;
-    int num_threads_x=16, num_threads_y=16;
+    int rows=4096;
+    int cols=2000;
+    int num_threads_x=TILE_SIZE, num_threads_y=TILE_SIZE;
     int num_blocks_x = (cols + num_threads_x - 1) / num_threads_x;
     int num_blocks_y = (rows + num_threads_y - 1) / num_threads_y;
     float* input_matrix = (float*)malloc(rows*cols*sizeof(float));
@@ -42,7 +57,7 @@ int main()
 
     cudaEventRecord(start);
 
-    transpose<<<blocks,threads>>>(inputc,outputc,cols,rows);
+    transpose<<<blocks,threads>>>(inputc,outputc,rows,cols);
 
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
@@ -54,22 +69,22 @@ int main()
 
     cudaMemcpy(output_matrix, outputc, rows*cols*sizeof(float), cudaMemcpyDeviceToHost);
 
-    for(int i=0; i<rows; i++)
-    {
-        for(int j=0; j<cols; j++)
-        {
-            printf("%f ",input_matrix[i*cols+j]);
-        }
-        printf("\n");
-    }
-    for(int i=0; i<cols; i++)
-    {
-        for(int j=0; j<rows; j++)
-        {
-            printf("%f ",output_matrix[i*rows+j]);
-        }
-        printf("\n");
-    }
+    // for(int i=0; i<rows; i++)
+    // {
+    //     for(int j=0; j<cols; j++)
+    //     {
+    //         printf("%f ",input_matrix[i*cols+j]);
+    //     }
+    //     printf("\n");
+    // }
+    // for(int i=0; i<cols; i++)
+    // {
+    //     for(int j=0; j<rows; j++)
+    //     {
+    //         printf("%f ",output_matrix[i*rows+j]);
+    //     }
+    //     printf("\n");
+    // }
     
     return 0;
 }
