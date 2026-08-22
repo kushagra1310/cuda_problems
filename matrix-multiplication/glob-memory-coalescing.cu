@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <cuda_runtime.h>
 
+#define BLOCKSIZE 32
 #define CHECK_CUDA(call)                                                   \
 do {                                                                       \
     cudaError_t err = call;                                                \
@@ -16,8 +17,8 @@ do {                                                                       \
 __global__ void naive_mult(double* A, double* B, double* C,
                            int rows1, int mid, int cols2)
 {
-    int col = blockIdx.y * blockDim.y + threadIdx.y;
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    int col = blockIdx.x * BLOCKSIZE + (threadIdx.x%BLOCKSIZE);
+    int row = blockIdx.y * BLOCKSIZE + (threadIdx.x/BLOCKSIZE);
 
     if (row < rows1 && col < cols2)
     {
@@ -39,8 +40,8 @@ int main()
     int mid  = 4096;
     int cols = 4096;
 
-    int num_threadsx = 16;
-    int num_threadsy = 16;
+    int num_threadsx = BLOCKSIZE;
+    int num_threadsy = BLOCKSIZE;
 
 
     double* A = (double*)malloc(rows * mid * sizeof(double));
@@ -92,13 +93,13 @@ int main()
         cudaMemcpyHostToDevice
     ));
 
-    dim3 blockDim(num_threadsx, num_threadsy, 1);
+    dim3 blockDim(num_threadsx*num_threadsy,1, 1);
 
     int num_blocksx =
-        (rows + num_threadsx - 1) / num_threadsx;
+        (cols + num_threadsx - 1) / num_threadsx;
 
     int num_blocksy =
-        (cols + num_threadsy - 1) / num_threadsy;
+        (rows + num_threadsy - 1) / num_threadsy;
 
     dim3 gridDim(num_blocksx, num_blocksy, 1);
 
