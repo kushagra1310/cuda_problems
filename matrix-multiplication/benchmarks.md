@@ -95,3 +95,18 @@ Performance         : 90.47 GFLOPS
 C[0][0] = 366369669120.000000
 C[100][100] = 397134725120.000000
 
+## Shared memory multiple per thread
+1. 
+2. 
+Matrix size: 4096 x 4096 x 4096
+Block size: 64 x 8
+Grid size: 64 x 64
+
+========================================
+Naive GEMM Benchmark
+========================================
+Average kernel time : 1380.7439 ms
+Performance         : 99.54 GFLOPS
+========================================
+C[0][0] = 366369669120.000000
+C[100][100] = 397134725120.000000
