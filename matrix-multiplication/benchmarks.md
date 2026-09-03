@@ -119,8 +119,24 @@ Grid size: 64 x 64
 ========================================
 Naive GEMM Benchmark
 ========================================
-Average kernel time : 1278.0945 ms
-Performance         : 107.53 GFLOPS
+Average kernel time : 1280.0764 ms
+Performance         : 107.37 GFLOPS
 ========================================
 C[0][0] = 366369669120.000000
 C[100][100] = 397134725120.000000
+
+## Vectorized access
+Matrix size: 4096 x 4096 x 4096
+Block size: 8 x 8
+Grid size: 64 x 64
+
+========================================
+Naive GEMM Benchmark
+========================================
+Average kernel time : 1279.6749 ms
+Performance         : 107.40 GFLOPS
+========================================
+C[0][0] = 366369669120.000000
+C[100][100] = 397134725120.000000
+
+## 
