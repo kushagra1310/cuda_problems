@@ -1,243 +1,158 @@
+/*
+ * Kernel 5: 2-D Blocktiling (TM × TN results per thread)
+ *
+ * Extends kernel 4 to compute a 2-D tile (TM rows × TN cols) per thread.
+ * Each thread caches TM entries of A and TN entries of B in registers,
+ * then performs an outer-product accumulation — maximising register reuse
+ * and further raising arithmetic intensity.
+ *
+ * Tile dimensions: BM × BK (A tile) and BK × BN (B tile).
+ * Threads per block: (BN/TN) × (BM/TM)
+ *
+ * Reference: https://siboehm.com/articles/22/CUDA-MMM  (Kernel 5)
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <cuda_runtime.h>
+#include "gemm_utils.cuh"
 
-#define BM 64
-#define BN 64
-#define STRIDE 8
-#define PERTHREADX 8
-#define PERTHREADY 8
-#define CHECK_CUDA(call)                                          \
-    do                                                            \
-    {                                                             \
-        cudaError_t err = call;                                   \
-        if (err != cudaSuccess)                                   \
-        {                                                         \
-            fprintf(stderr, "CUDA error at %s:%d: %s\n",          \
-                    __FILE__, __LINE__, cudaGetErrorString(err)); \
-            exit(EXIT_FAILURE);                                   \
-        }                                                         \
-    } while (0)
+#define BM  64
+#define BN  64
+#define BK   8
+#define TM   8
+#define TN   8
 
-__global__ void shared_mult(double *A, double *B, double *C,
-                            int rows1, int mid, int cols2)
+static_assert(BM % TM == 0, "BM must be divisible by TM");
+static_assert(BN % TN == 0, "BN must be divisible by TN");
+// The tile-loading loops iterate multiple times if numThreads < tile size — that's fine.
+
+// ---------------------------------------------------------------------------
+__global__ void sgemm_2d_blocktile(int M, int N, int K,
+                                    const float * __restrict__ A,
+                                    const float * __restrict__ B,
+                                    float       * __restrict__ C)
 {
-    __shared__ double As[BM][STRIDE];
-    __shared__ double Bs[STRIDE][BN];
+    __shared__ float As[BM * BK];  // stored row-major: As[row*BK + col]
+    __shared__ float Bs[BK * BN];  // stored row-major: Bs[row*BN + col]
 
-    double threadResults[PERTHREADX * PERTHREADY] = {0.0};
-    double regM[PERTHREADX] = {0.0};
-    double regN[PERTHREADY] = {0.0};
+    const int cRow = blockIdx.y;
+    const int cCol = blockIdx.x;
 
-    int tid = threadIdx.x + blockDim.x * threadIdx.y;
-    for (int blockidx = 0; blockidx < mid; blockidx += STRIDE)
-    {
-        for (int i = tid; i < BM * STRIDE; i += blockDim.x * blockDim.y)
-        {
-            int row = i / STRIDE;
-            int col = i % STRIDE;
+    // Thread position within the block tile
+    const int threadRow = threadIdx.y; // 0 .. BM/TM - 1
+    const int threadCol = threadIdx.x; // 0 .. BN/TN - 1
+    const int tid = threadIdx.y * blockDim.x + threadIdx.x;
 
-            if(blockIdx.y * BM + row<rows1 && blockidx + col<mid)
-                As[row][col] = A[(blockIdx.y * BM + row) * mid + blockidx + col];
+    // Advance base pointers to this block's starting position
+    A += cRow * BM * K;
+    B += cCol * BN;
+    C += cRow * BM * N + cCol * BN;
+
+    // Per-thread result accumulator (TM × TN)
+    float threadResults[TM * TN] = {0.f};
+    float regM[TM] = {0.f};
+    float regN[TN] = {0.f};
+
+    const int numThreads = blockDim.x * blockDim.y;
+
+    for (int bkIdx = 0; bkIdx < K; bkIdx += BK) {
+        // ---- load A tile: BM×BK elements, numThreads threads ---------------
+        for (int i = tid; i < BM * BK; i += numThreads) {
+            int row = i / BK, col = i % BK;
+            As[row * BK + col] =
+                (cRow * BM + row < M && bkIdx + col < K)
+                ? A[row * K + col] : 0.f;
         }
-        for (int i = tid;
-             i < STRIDE * BN;
-             i += blockDim.x * blockDim.y)
-        {
-            int row = i / BN;
-            int col = i % BN;
 
-            int globalRow = blockidx + row;
-            int globalCol = blockIdx.x * BN + col;
-
-            if (globalRow < mid && globalCol < cols2)
-            {
-                Bs[row][col] =
-                    B[globalRow * cols2 + globalCol];
-            }
-            else
-            {
-                Bs[row][col] = 0.0;
-            }
+        // ---- load B tile: BK×BN elements -----------------------------------
+        for (int i = tid; i < BK * BN; i += numThreads) {
+            int row = i / BN, col = i % BN;
+            Bs[row * BN + col] =
+                (bkIdx + row < K && cCol * BN + col < N)
+                ? B[row * N + col] : 0.f;
         }
 
         __syncthreads();
-        for (int k = 0; k < STRIDE; k++)
-        {
-            for (int i = 0; i < PERTHREADX; i++)
-            {
-                regM[i] = As[threadIdx.y*PERTHREADY + i][k];
-            }
-            for(int i=0; i<PERTHREADY; i++)
-            {
-                regN[i] = Bs[k][PERTHREADX*threadIdx.x+i];
-            }
-            for(int i=0; i<PERTHREADY; i++)
-            {
-                for(int j=0; j<PERTHREADX; j++)
-                {
-                    threadResults[i*PERTHREADX+j]+=regM[i]*regN[j];
-                }
-            }
+        A += BK;
+        B += BK * N;
+
+        // ---- compute outer-product accumulation ----------------------------
+        for (int dotIdx = 0; dotIdx < BK; ++dotIdx) {
+            // load this thread's slice of As and Bs into registers
+            for (int i = 0; i < TM; ++i)
+                regM[i] = As[(threadRow * TM + i) * BK + dotIdx];
+            for (int i = 0; i < TN; ++i)
+                regN[i] = Bs[dotIdx * BN + threadCol * TN + i];
+            // outer product
+            for (int i = 0; i < TM; ++i)
+                for (int j = 0; j < TN; ++j)
+                    threadResults[i * TN + j] += regM[i] * regN[j];
         }
+
         __syncthreads();
     }
-    for (int i = 0; i < PERTHREADY; i++)
-    {
-        for(int j=0; j<PERTHREADX; j++)
-        {
-            int row=blockIdx.y*BM+threadIdx.y*PERTHREADY+i;
-            int col=blockIdx.x*BN+threadIdx.x*PERTHREADX+j;
-            if(row<rows1 && col<cols2)
-            {
-                C[row*cols2+col]=threadResults[i*PERTHREADX+j];
-            }
+
+    // ---- write back -------------------------------------------------------
+    for (int i = 0; i < TM; ++i) {
+        for (int j = 0; j < TN; ++j) {
+            int row = cRow * BM + threadRow * TM + i;
+            int col = cCol * BN + threadCol * TN + j;
+            if (row < M && col < N)
+                C[(threadRow * TM + i) * N + threadCol * TN + j] =
+                    threadResults[i * TN + j];
         }
     }
 }
 
+// ---------------------------------------------------------------------------
 int main()
 {
-    int rows = 4096;
-    int mid = 4096;
-    int cols = 4096;
+    const int M = GEMM_M, N = GEMM_N, K = GEMM_K;
 
-    int num_threadsx = BN / PERTHREADY;
-    int num_threadsy = BM / PERTHREADX;
+    float *h_A = (float *)malloc((size_t)M * K * sizeof(float));
+    float *h_B = (float *)malloc((size_t)K * N * sizeof(float));
+    float *h_C = (float *)malloc((size_t)M * N * sizeof(float));
 
-    double *A = (double *)malloc(rows * mid * sizeof(double));
-    double *B = (double *)malloc(mid * cols * sizeof(double));
-    double *C = (double *)malloc(rows * cols * sizeof(double));
+    init_random(h_A, M * K, 42u);
+    init_random(h_B, K * N, 43u);
 
-    if (A == NULL || B == NULL || C == NULL)
-    {
-        printf("Host memory allocation failed\n");
-        return 1;
-    }
+    float *d_A, *d_B, *d_C, *d_C_ref;
+    CHECK_CUDA(cudaMalloc(&d_A, (size_t)M * K * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_B, (size_t)K * N * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_C, (size_t)M * N * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_C_ref, (size_t)M * N * sizeof(float)));
 
-    for (int i = 0; i < rows; i++)
-    {
-        for (int j = 0; j < mid; j++)
-        {
-            A[i * mid + j] = i * 2.0 + j * 4.0;
-        }
-    }
+    CHECK_CUDA(cudaMemcpy(d_A, h_A, (size_t)M * K * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_B, h_B, (size_t)K * N * sizeof(float), cudaMemcpyHostToDevice));
 
-    for (int i = 0; i < mid; i++)
-    {
-        for (int j = 0; j < cols; j++)
-        {
-            B[i * cols + j] = i * 4.0 + j * 7.0;
-        }
-    }
+    cublas_sgemm_ref(M, N, K, d_A, d_B, d_C_ref);
 
-    double *cA, *cB, *cC;
+    dim3 blockDim(BN / TN, BM / TM, 1);
+    dim3 gridDim((N + BN - 1) / BN,
+                 (M + BM - 1) / BM, 1);
 
-    CHECK_CUDA(cudaMalloc(&cA, rows * mid * sizeof(double)));
-    CHECK_CUDA(cudaMalloc(&cB, mid * cols * sizeof(double)));
-    CHECK_CUDA(cudaMalloc(&cC, rows * cols * sizeof(double)));
+    printf("Matrix: %d x %d x %d\n", M, N, K);
+    printf("BM=%d BN=%d BK=%d TM=%d TN=%d\n", BM, BN, BK, TM, TN);
+    printf("Block : %d x %d  |  Grid: %d x %d\n",
+           blockDim.x, blockDim.y, gridDim.x, gridDim.y);
 
-    CHECK_CUDA(cudaMemcpy(
-        cA,
-        A,
-        rows * mid * sizeof(double),
-        cudaMemcpyHostToDevice));
+    auto kernel = [&]() {
+        sgemm_2d_blocktile<<<gridDim, blockDim>>>(M, N, K, d_A, d_B, d_C);
+    };
 
-    CHECK_CUDA(cudaMemcpy(
-        cB,
-        B,
-        mid * cols * sizeof(double),
-        cudaMemcpyHostToDevice));
+    float avg_ms = benchmark_ms(kernel);
+    print_results("Kernel 5: 2D Blocktiling", M, N, K, avg_ms);
 
-    dim3 blockDim(num_threadsx, num_threadsy, 1);
-
-    int num_blocksx =
-        (cols + BN - 1) / BN;
-
-    int num_blocksy =
-        (rows + BM - 1) / BM;
-
-    dim3 gridDim(num_blocksx, num_blocksy, 1);
-
-    printf("Matrix size: %d x %d x %d\n", rows, mid, cols);
-    printf("Block size: %d x %d\n", num_threadsx, num_threadsy);
-    printf("Grid size: %d x %d\n", num_blocksx, num_blocksy);
-
-    const int warmup_runs = 5;
-
-    for (int i = 0; i < warmup_runs; i++)
-    {
-        shared_mult<<<gridDim, blockDim>>>(
-            cA, cB, cC,
-            rows, mid, cols);
-    }
-
-    CHECK_CUDA(cudaGetLastError());
+    kernel();
     CHECK_CUDA(cudaDeviceSynchronize());
+    verify_correctness(M, N, d_C, d_C_ref);
 
-    const int benchmark_runs = 20;
-
-    cudaEvent_t start, stop;
-
-    CHECK_CUDA(cudaEventCreate(&start));
-    CHECK_CUDA(cudaEventCreate(&stop));
-
-    CHECK_CUDA(cudaEventRecord(start));
-
-    for (int i = 0; i < benchmark_runs; i++)
-    {
-        shared_mult<<<gridDim, blockDim>>>(
-            cA, cB, cC,
-            rows, mid, cols);
-    }
-
-    CHECK_CUDA(cudaEventRecord(stop));
-    CHECK_CUDA(cudaEventSynchronize(stop));
-
-    CHECK_CUDA(cudaGetLastError());
-
-    float total_ms = 0.0f;
-
-    CHECK_CUDA(cudaEventElapsedTime(
-        &total_ms,
-        start,
-        stop));
-
-    float avg_ms = total_ms / benchmark_runs;
-
-    double total_flops =
-        2.0 * (double)rows * (double)mid * (double)cols;
-
-    double gflops =
-        total_flops / (avg_ms * 1.0e6);
-
-    printf("\n");
-    printf("========================================\n");
-    printf("Naive GEMM Benchmark\n");
-    printf("========================================\n");
-    printf("Average kernel time : %.4f ms\n", avg_ms);
-    printf("Performance         : %.2f GFLOPS\n", gflops);
-    printf("========================================\n");
-
-    CHECK_CUDA(cudaMemcpy(
-        C,
-        cC,
-        rows * cols * sizeof(double),
-        cudaMemcpyDeviceToHost));
-
-    printf("C[0][0] = %f\n", C[0]);
-    printf("C[100][100] = %f\n", C[100 * cols + 100]);
-
-    CHECK_CUDA(cudaEventDestroy(start));
-    CHECK_CUDA(cudaEventDestroy(stop));
-
-    CHECK_CUDA(cudaFree(cA));
-    CHECK_CUDA(cudaFree(cB));
-    CHECK_CUDA(cudaFree(cC));
-
-    free(A);
-    free(B);
-    free(C);
+    CHECK_CUDA(cudaFree(d_A));
+    CHECK_CUDA(cudaFree(d_B));
+    CHECK_CUDA(cudaFree(d_C));
+    CHECK_CUDA(cudaFree(d_C_ref));
+    free(h_A); free(h_B); free(h_C);
 
     return 0;
 }

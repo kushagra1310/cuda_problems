@@ -1,199 +1,88 @@
+/*
+ * Kernel 2: Global Memory Coalescing
+ *
+ * Threads in a warp access consecutive columns of C (and consecutive
+ * elements of B's row), enabling the hardware to coalesce 32 × 4-byte loads
+ * into a single 128-byte transaction.  The 1-D block layout maps threadIdx.x
+ * to the N dimension (column) so adjacent threads → adjacent memory.
+ *
+ * Reference: https://siboehm.com/articles/22/CUDA-MMM  (Kernel 2)
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <cuda_runtime.h>
+#include "gemm_utils.cuh"
 
 #define BLOCKSIZE 32
-#define CHECK_CUDA(call)                                                   \
-do {                                                                       \
-    cudaError_t err = call;                                                \
-    if (err != cudaSuccess) {                                              \
-        fprintf(stderr, "CUDA error at %s:%d: %s\n",                       \
-                __FILE__, __LINE__, cudaGetErrorString(err));              \
-        exit(EXIT_FAILURE);                                                \
-    }                                                                      \
-} while (0)
 
-
-__global__ void naive_mult(double* A, double* B, double* C,
-                           int rows1, int mid, int cols2)
+// ---------------------------------------------------------------------------
+__global__ void sgemm_coalesced(int M, int N, int K,
+                                 const float * __restrict__ A,
+                                 const float * __restrict__ B,
+                                 float       * __restrict__ C)
 {
-    int col = blockIdx.x * BLOCKSIZE + (threadIdx.x%BLOCKSIZE);
-    int row = blockIdx.y * BLOCKSIZE + (threadIdx.x/BLOCKSIZE);
+    // 1-D block: remap threadIdx.x so that warp-adjacent threads own
+    // adjacent columns (coalesced B and C access).
+    const int row = blockIdx.x * BLOCKSIZE + threadIdx.x / BLOCKSIZE; // M
+    const int col = blockIdx.y * BLOCKSIZE + threadIdx.x % BLOCKSIZE; // N
 
-    if (row < rows1 && col < cols2)
-    {
-        double temp = 0.0;
-
-        for (int k = 0; k < mid; k++)
-        {
-            temp += A[row * mid + k] * B[k * cols2 + col];
-        }
-
-        C[row * cols2 + col] = temp;
+    if (row < M && col < N) {
+        float tmp = 0.f;
+        for (int k = 0; k < K; ++k)
+            tmp += A[row * K + k] * B[k * N + col];
+        C[row * N + col] = tmp;
     }
 }
 
-
+// ---------------------------------------------------------------------------
 int main()
 {
-    int rows = 4096;
-    int mid  = 4096;
-    int cols = 4096;
+    const int M = GEMM_M, N = GEMM_N, K = GEMM_K;
 
-    int num_threadsx = BLOCKSIZE;
-    int num_threadsy = BLOCKSIZE;
+    float *h_A = (float *)malloc((size_t)M * K * sizeof(float));
+    float *h_B = (float *)malloc((size_t)K * N * sizeof(float));
+    float *h_C = (float *)malloc((size_t)M * N * sizeof(float));
 
+    init_random(h_A, M * K, 42u);
+    init_random(h_B, K * N, 43u);
 
-    double* A = (double*)malloc(rows * mid * sizeof(double));
-    double* B = (double*)malloc(mid * cols * sizeof(double));
-    double* C = (double*)malloc(rows * cols * sizeof(double));
+    float *d_A, *d_B, *d_C, *d_C_ref;
+    CHECK_CUDA(cudaMalloc(&d_A, (size_t)M * K * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_B, (size_t)K * N * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_C, (size_t)M * N * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_C_ref, (size_t)M * N * sizeof(float)));
 
-    if (A == NULL || B == NULL || C == NULL)
-    {
-        printf("Host memory allocation failed\n");
-        return 1;
-    }
+    CHECK_CUDA(cudaMemcpy(d_A, h_A, (size_t)M * K * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_B, h_B, (size_t)K * N * sizeof(float), cudaMemcpyHostToDevice));
 
+    cublas_sgemm_ref(M, N, K, d_A, d_B, d_C_ref);
 
-    for (int i = 0; i < rows; i++)
-    {
-        for (int j = 0; j < mid; j++)
-        {
-            A[i * mid + j] = i * 2.0 + j * 4.0;
-        }
-    }
+    // 1-D block of BLOCKSIZE*BLOCKSIZE threads
+    dim3 blockDim(BLOCKSIZE * BLOCKSIZE, 1, 1);
+    dim3 gridDim((M + BLOCKSIZE - 1) / BLOCKSIZE,
+                 (N + BLOCKSIZE - 1) / BLOCKSIZE, 1);
 
-    for (int i = 0; i < mid; i++)
-    {
-        for (int j = 0; j < cols; j++)
-        {
-            B[i * cols + j] = i * 4.0 + j * 7.0;
-        }
-    }
+    printf("Matrix: %d x %d x %d\n", M, N, K);
+    printf("Block : %d  |  Grid: %d x %d\n",
+           blockDim.x, gridDim.x, gridDim.y);
 
+    auto kernel = [&]() {
+        sgemm_coalesced<<<gridDim, blockDim>>>(M, N, K, d_A, d_B, d_C);
+    };
 
-    double *cA, *cB, *cC;
+    float avg_ms = benchmark_ms(kernel);
+    print_results("Kernel 2: Global Memory Coalescing", M, N, K, avg_ms);
 
-    CHECK_CUDA(cudaMalloc(&cA, rows * mid * sizeof(double)));
-    CHECK_CUDA(cudaMalloc(&cB, mid * cols * sizeof(double)));
-    CHECK_CUDA(cudaMalloc(&cC, rows * cols * sizeof(double)));
-
-
-    CHECK_CUDA(cudaMemcpy(
-        cA,
-        A,
-        rows * mid * sizeof(double),
-        cudaMemcpyHostToDevice
-    ));
-
-    CHECK_CUDA(cudaMemcpy(
-        cB,
-        B,
-        mid * cols * sizeof(double),
-        cudaMemcpyHostToDevice
-    ));
-
-    dim3 blockDim(num_threadsx*num_threadsy,1, 1);
-
-    int num_blocksx =
-        (cols + num_threadsx - 1) / num_threadsx;
-
-    int num_blocksy =
-        (rows + num_threadsy - 1) / num_threadsy;
-
-    dim3 gridDim(num_blocksx, num_blocksy, 1);
-
-
-    printf("Matrix size: %d x %d x %d\n", rows, mid, cols);
-    printf("Block size: %d x %d\n", num_threadsx, num_threadsy);
-    printf("Grid size: %d x %d\n", num_blocksx, num_blocksy);
-
-
-    const int warmup_runs = 5;
-
-    for (int i = 0; i < warmup_runs; i++)
-    {
-        naive_mult<<<gridDim, blockDim>>>(
-            cA, cB, cC,
-            rows, mid, cols
-        );
-    }
-
-    CHECK_CUDA(cudaGetLastError());
+    kernel();
     CHECK_CUDA(cudaDeviceSynchronize());
+    verify_correctness(M, N, d_C, d_C_ref);
 
-
-    const int benchmark_runs = 20;
-
-    cudaEvent_t start, stop;
-
-    CHECK_CUDA(cudaEventCreate(&start));
-    CHECK_CUDA(cudaEventCreate(&stop));
-
-    CHECK_CUDA(cudaEventRecord(start));
-
-    for (int i = 0; i < benchmark_runs; i++)
-    {
-        naive_mult<<<gridDim, blockDim>>>(
-            cA, cB, cC,
-            rows, mid, cols
-        );
-    }
-
-    CHECK_CUDA(cudaEventRecord(stop));
-    CHECK_CUDA(cudaEventSynchronize(stop));
-
-    CHECK_CUDA(cudaGetLastError());
-
-
-    float total_ms = 0.0f;
-
-    CHECK_CUDA(cudaEventElapsedTime(
-        &total_ms,
-        start,
-        stop
-    ));
-
-    float avg_ms = total_ms / benchmark_runs;
-
-    double total_flops =
-        2.0 * (double)rows * (double)mid * (double)cols;
-
-    double gflops =
-        total_flops / (avg_ms * 1.0e6);
-
-
-    printf("\n");
-    printf("========================================\n");
-    printf("Naive GEMM Benchmark\n");
-    printf("========================================\n");
-    printf("Average kernel time : %.4f ms\n", avg_ms);
-    printf("Performance         : %.2f GFLOPS\n", gflops);
-    printf("========================================\n");
-
-
-    CHECK_CUDA(cudaMemcpy(
-        C,
-        cC,
-        rows * cols * sizeof(double),
-        cudaMemcpyDeviceToHost
-    ));
-
-
-    printf("C[0][0] = %f\n", C[0]);
-    printf("C[100][100] = %f\n", C[100 * cols + 100]);
-
-
-    CHECK_CUDA(cudaEventDestroy(start));
-    CHECK_CUDA(cudaEventDestroy(stop));
-
-    CHECK_CUDA(cudaFree(cA));
-    CHECK_CUDA(cudaFree(cB));
-    CHECK_CUDA(cudaFree(cC));
-
-    free(A);
-    free(B);
-    free(C);
+    CHECK_CUDA(cudaFree(d_A));
+    CHECK_CUDA(cudaFree(d_B));
+    CHECK_CUDA(cudaFree(d_C));
+    CHECK_CUDA(cudaFree(d_C_ref));
+    free(h_A); free(h_B); free(h_C);
 
     return 0;
 }
