@@ -69,6 +69,9 @@ benchmark: all
 	@echo ""
 	@echo "========== Kernel 9: Autotuned =========="
 	./k9_autotuned
+	@echo ""
+    @echo "========== Kernel 10: Warp Tiling =========="
+    ./k10_warptiling
 
 clean:
 	rm -f $(KERNELS) gemm_test a.out *.o
