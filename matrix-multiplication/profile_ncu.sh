@@ -21,7 +21,12 @@ set -e
 
 NVCC_FLAGS="-O3 -std=c++17 -lcublas"
 OUTDIR="ncu_results"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 mkdir -p "$OUTDIR"
+
+GPU_TAG=$("$SCRIPT_DIR/gpu_info.sh")
+GPU_SAFE=$(echo "$GPU_TAG" | tr -c 'A-Za-z0-9' '_')
+echo "Tagging this profiling run as GPU: $GPU_TAG"
 
 declare -A KERNELS=(
   ["cublas_baseline"]="cublas_baseline.cu"
@@ -38,14 +43,7 @@ declare -A KERNELS=(
 # Keep this list short — each entry multiplies total profiling time.
 # Pick sizes that let you talk about small-vs-large and square-vs-non-square
 # behavior without profiling the entire wall-clock sweep.
-DEFAULT_DIMS=(
-  "512,512,512"
-  "2048,2048,2048"
-  "4096,4096,4096"
-  "4096,4096,512"
-  "512,4096,4096"
-  "4096,512,4096"
-)
+DEFAULT_DIMS=("1024,1024,1024" "3000,1500,2048" "4096,4096,4096")
 
 if [ "$#" -eq 0 ]; then
   BINS=(k1_naive k2_coalesced k3_shared k4_1d_blocktile k5_2d_blocktile k6_vectorized k9_autotuned k10_warptiling)
@@ -73,7 +71,12 @@ l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum,\
 smsp__sass_average_branch_targets_threads_uniform.pct,\
 sm__throughput.avg.pct_of_peak_sustained_elapsed"
 
-echo "kernel,M,N,K,$(echo $METRICS | tr ',' ',')" > "$OUTDIR/ncu_merged.csv"
+# NOTE: no unconditional header-write here (unlike an earlier version of
+# this script) — ncu_merged.csv is created/appended lazily by the Python
+# snippet below, which checks the existing header before deciding whether
+# to write a new one. This means results from multiple GPUs/runs
+# accumulate into the same file instead of the second run wiping out the
+# first, matching how run_sweep.sh and param_sweep.sh handle their CSVs.
 
 for bin in "${BINS[@]}"; do
   src="${KERNELS[$bin]}"
@@ -89,7 +92,7 @@ for bin in "${BINS[@]}"; do
       echo "  [SKIP] compile failed"; continue
     }
 
-    RAW_CSV="$OUTDIR/${bin}_${M}x${N}x${K}.csv"
+    RAW_CSV="$OUTDIR/${bin}_${M}x${N}x${K}_${GPU_SAFE}.csv"
 
     # --launch-skip 5: our benchmark_ms() does 5 warmup launches before the
     #   timed loop — skip those so we profile a steady-state launch, not a
@@ -100,18 +103,18 @@ for bin in "${BINS[@]}"; do
         --csv --page raw \
         --launch-skip 5 --launch-count 1 \
         --target-processes all \
-        ./"${bin}_ncu" > "$RAW_CSV" 2>"$OUTDIR/${bin}_${M}x${N}x${K}.log" || {
-      echo "  [WARN] ncu failed for $bin @ ${M}x${N}x${K} — see ${bin}_${M}x${N}x${K}.log"
+        ./"${bin}_ncu" > "$RAW_CSV" 2>"$OUTDIR/${bin}_${M}x${N}x${K}_${GPU_SAFE}.log" || {
+      echo "  [WARN] ncu failed for $bin @ ${M}x${N}x${K} — see ${bin}_${M}x${N}x${K}_${GPU_SAFE}.log"
       echo "         (often ERR_NVGPUCTRPERM — see permission note at top of this script)"
       rm -f "${bin}_ncu"
       continue
     }
 
     # ncu's raw CSV is metric-per-row; pivot to one row of metric:value pairs
-    # tagged with kernel/M/N/K, appended to the merged file for pandas.
-    python3 - "$RAW_CSV" "$bin" "$M" "$N" "$K" "$OUTDIR/ncu_merged.csv" <<'PYEOF'
+    # tagged with kernel/M/N/K/gpu, appended to the merged file for pandas.
+    python3 - "$RAW_CSV" "$bin" "$M" "$N" "$K" "$GPU_TAG" "$OUTDIR/ncu_merged.csv" <<'PYEOF'
 import csv, sys
-raw_path, kernel, M, N, K, merged_path = sys.argv[1:7]
+raw_path, kernel, M, N, K, gpu, merged_path = sys.argv[1:8]
 metrics = {}
 with open(raw_path) as f:
     reader = csv.DictReader(f)
@@ -120,7 +123,7 @@ with open(raw_path) as f:
         val = row.get("Metric Value")
         if name:
             metrics[name] = val
-header = ["kernel", "M", "N", "K"] + list(metrics.keys())
+header = ["kernel", "M", "N", "K", "gpu"] + list(metrics.keys())
 write_header = False
 try:
     with open(merged_path) as f:
@@ -132,7 +135,7 @@ mode = "a"
 with open(merged_path, mode) as f:
     if write_header:
         f.write(",".join(header) + "\n")
-    row = [kernel, M, N, K] + [str(metrics[k]) for k in metrics]
+    row = [kernel, M, N, K, gpu] + [str(metrics[k]) for k in metrics]
     f.write(",".join(row) + "\n")
 PYEOF
 

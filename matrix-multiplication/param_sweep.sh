@@ -40,7 +40,11 @@ WM=64
 WN=64
 WNITER=4
 
-echo "kernel,BM,BN,BK,TM,TN,M,N,K,threads,smem_bytes,avg_ms,gflops,correct,status,gpu" > "$LOG"
+if [ ! -f "$LOG" ]; then
+    echo "kernel,BM,BN,BK,TM,TN,M,N,K,threads,smem_bytes,avg_ms,gflops,correct,status,gpu" > "$LOG"
+else
+    echo "Appending to existing $LOG (delete it first if you want a clean sweep)"
+fi
 
 
 # ============================================================

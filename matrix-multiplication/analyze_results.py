@@ -334,6 +334,11 @@ def plot_param_sensitivity(df, outdir):
 # ---------------------------------------------------------------------
 def plot_hw_correlation(sweep_df, ncu_df, outdir):
     merge_cols = ["kernel", "M", "N", "K"]
+    if "gpu" in ncu_df.columns and "gpu" in sweep_df.columns:
+        merge_cols.append("gpu")
+    else:
+        print("  [note] ncu CSV has no 'gpu' column (from an older profile_ncu.sh run) — "
+              "merging without it; fine for single-GPU data, may cross-match across GPUs otherwise.")
     sweep_df = sweep_df.copy(); ncu_df = ncu_df.copy()
     for c in ["M", "N", "K"]:
         sweep_df[c] = pd.to_numeric(sweep_df[c], errors="coerce")
