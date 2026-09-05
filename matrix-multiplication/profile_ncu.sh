@@ -38,7 +38,14 @@ declare -A KERNELS=(
 # Keep this list short — each entry multiplies total profiling time.
 # Pick sizes that let you talk about small-vs-large and square-vs-non-square
 # behavior without profiling the entire wall-clock sweep.
-DEFAULT_DIMS=("1024,1024,1024" "3000,1500,2048" "4096,4096,4096")
+DEFAULT_DIMS=(
+  "512,512,512"
+  "2048,2048,2048"
+  "4096,4096,4096"
+  "4096,4096,512"
+  "512,4096,4096"
+  "4096,512,4096"
+)
 
 if [ "$#" -eq 0 ]; then
   BINS=(k1_naive k2_coalesced k3_shared k4_1d_blocktile k5_2d_blocktile k6_vectorized k9_autotuned k10_warptiling)
